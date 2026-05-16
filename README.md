@@ -1,7 +1,8 @@
 # FAST-LIVO2-AGX (ROS 2 Humble)
 
 > **FAST-LIVO2: Fast, Direct LiDAR-Inertial-Visual Odometry — U-AMC fork**
-> Many thanks to HKU MARS Lab and [Chunran Zheng](https://github.com/xuankuzcr) for open-sourcing the original work. This is a ROS 2 Humble fork maintained by U-AMC, targeting NVIDIA Jetson AGX Orin and Intel NUC platforms with extended sensor support.
+> Many thanks to HKU MARS Lab and [Chunran Zheng](https://github.com/xuankuzcr) for open-sourcing the original work. 
+This is a ROS 2 Humble fork maintained by U-AMC, targeting NVIDIA Jetson AGX Orin and Intel NUC platforms with extended sensor support.
 
 ### What this fork adds
 
