@@ -13,7 +13,7 @@ which is included as part of this source code package.
 #include "vio.h"
 
 using namespace Eigen;
-VIOManager::VIOManager()
+VIOManager::VIOManager() : cam(nullptr), visual_submap(nullptr)
 {
   // downSizeFilter.setLeafSize(0.2, 0.2, 0.2);
 }
