@@ -227,6 +227,7 @@ void VIOManager::getImagePatch(cv::Mat img, V2D pc, float *patch_tmp, int level)
 
 void VIOManager::insertPointIntoVoxelMap(VisualPoint *pt_new)
 {
+  static constexpr std::size_t kMaxVisualPointsPerVoxel = 50;
   V3D pt_w(pt_new->pos_[0], pt_new->pos_[1], pt_new->pos_[2]);
   double voxel_size = 0.5;
   float loc_xyz[3];
@@ -239,6 +240,11 @@ void VIOManager::insertPointIntoVoxelMap(VisualPoint *pt_new)
   auto iter = feat_map.find(position);
   if (iter != feat_map.end())
   {
+    if (iter->second->voxel_points.size() >= kMaxVisualPointsPerVoxel)
+    {
+      delete pt_new;
+      return;
+    }
     iter->second->voxel_points.push_back(pt_new);
     iter->second->count++;
   }
@@ -931,8 +937,6 @@ void VIOManager::updateVisualMapPoints(cv::Mat img)
     if (!new_frame_->cam_->isInFrame(pc.cast<int>(), border)) continue;
     bool add_flag = false;
 
-    float *patch_temp = new float[patch_size_total];
-    getImagePatch(img, pc, patch_temp, 0);
     // TODO: condition: distance and view_angle
     // Step 1: time
     Feature *last_feature = pt->obs_.back();
@@ -960,6 +964,8 @@ void VIOManager::updateVisualMapPoints(cv::Mat img)
     }
     if (add_flag)
     {
+      float *patch_temp = new float[patch_size_total];
+      getImagePatch(img, pc, patch_temp, 0);
       update_num += 1;
       update_flag[i] = 1;
       Vector3d f = cam->cam2world(pc);
