@@ -101,9 +101,7 @@ void Preprocess::avia_handler(const livox_custom_msg::CustomMsg::SharedPtr &msg)
   pl_surf.clear();
   pl_corn.clear();
   pl_full.clear();
-  double t1 = omp_get_wtime();
   int plsize = msg->point_num;
-  printf("[ Preprocess ] Input point number: %d \n", plsize);
   // printf("point_filter_num: %d\n", point_filter_num);
 
   pl_corn.reserve(plsize);
@@ -137,10 +135,6 @@ void Preprocess::avia_handler(const livox_custom_msg::CustomMsg::SharedPtr &msg)
         }
       }
     }
-    static int count = 0;
-    static double time = 0.0;
-    count++;
-    double t0 = omp_get_wtime();
     for (int j = 0; j < N_SCANS; j++)
     {
       if (pl_buff[j].size() <= 5) continue;
@@ -162,8 +156,6 @@ void Preprocess::avia_handler(const livox_custom_msg::CustomMsg::SharedPtr &msg)
       give_feature(pl, types);
       // pl_surf += pl;
     }
-    time += omp_get_wtime() - t0;
-    printf("Feature extraction time: %lf \n", time / count);
   }
   else
   {
@@ -201,7 +193,6 @@ void Preprocess::avia_handler(const livox_custom_msg::CustomMsg::SharedPtr &msg)
       }
     }
   }
-  printf("[ Preprocess ] Output point number: %zu \n", pl_surf.points.size());
 }
 
 void Preprocess::l515_handler(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg)

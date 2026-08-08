@@ -345,9 +345,10 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
       // cout<<"angvel_avr: "<<angvel_avr.transpose()<<endl;
       // cout<<"acc_avr: "<<acc_avr.transpose()<<endl;
 
-      // #ifdef DEBUG_PRINT
+#ifdef DEBUG_PRINT
+      // 默认构建禁止 200 Hz 文件 flush；仅显式调试构建保留逐样本 IMU 记录。
       fout_imu << setw(10) << stamp2Sec(head->header.stamp) - first_lidar_time << " " << angvel_avr.transpose() << " " << acc_avr.transpose() << endl;
-      // #endif
+#endif
 
       // imu_time = stamp2Sec(head->header.stamp) - first_lidar_time;
 
@@ -579,7 +580,9 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, Poin
       RCLCPP_INFO(rclcpp::get_logger(""), "IMU Initials: ba covarience: %.8f %.8f %.8f; bg covarience: "
                "%.8f %.8f %.8f",
                cov_bias_acc[0], cov_bias_acc[1], cov_bias_acc[2], cov_bias_gyr[0], cov_bias_gyr[1], cov_bias_gyr[2]);
+#ifdef DEBUG_PRINT
       fout_imu.open(DEBUG_FILE_DIR("imu.txt"), ios::out);
+#endif
     }
 
     return;

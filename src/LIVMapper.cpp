@@ -11,9 +11,19 @@ which is included as part of this source code package.
 */
 
 #include "LIVMapper.h"
+#include <cstddef>
 #include <vikit/camera_loader.h>
 
 using namespace Sophus;
+
+namespace
+{
+// 在线 Mid-360S 只需保留有限实时窗口；1 s 余量覆盖约 10 帧 LiDAR 和 200 条 IMU。
+constexpr std::size_t kLidarSubscriptionDepth = 10;
+constexpr std::size_t kImuSubscriptionDepth = 200;
+constexpr int kRuntimeLogThrottleMs = 1000;
+}
+
 LIVMapper::LIVMapper(rclcpp::Node::SharedPtr &node, std::string node_name)
     : node(std::make_shared<rclcpp::Node>(node_name)),
       extT(0, 0, 0),
@@ -294,19 +304,19 @@ void LIVMapper::initializeSubscribersAndPublishers(rclcpp::Node::SharedPtr &node
     this->node->get_parameter("common.livox_msg_type", livox_msg_type);
 
     if (livox_msg_type == "livox_interfaces") {
-      sub_pcl = this->node->create_subscription<livox_interfaces::msg::CustomMsg>(lid_topic, 200000, std::bind(&LIVMapper::livox_interfaces_pcl_cbk, this, std::placeholders::_1));
+      sub_pcl = this->node->create_subscription<livox_interfaces::msg::CustomMsg>(lid_topic, kLidarSubscriptionDepth, std::bind(&LIVMapper::livox_interfaces_pcl_cbk, this, std::placeholders::_1));
       RCLCPP_INFO(this->node->get_logger(), "Using livox_interfaces::msg::CustomMsg for '%s'", lid_topic.c_str());
     } else {
-      sub_pcl = this->node->create_subscription<livox_custom_msg::CustomMsg>(lid_topic, 200000, std::bind(&LIVMapper::livox_pcl_cbk, this, std::placeholders::_1));
+      sub_pcl = this->node->create_subscription<livox_custom_msg::CustomMsg>(lid_topic, kLidarSubscriptionDepth, std::bind(&LIVMapper::livox_pcl_cbk, this, std::placeholders::_1));
       RCLCPP_INFO(this->node->get_logger(), "Using livox_ros_driver2::msg::CustomMsg for '%s'", lid_topic.c_str());
     }
 #else
-    sub_pcl = this->node->create_subscription<livox_custom_msg::CustomMsg>(lid_topic, 200000, std::bind(&LIVMapper::livox_pcl_cbk, this, std::placeholders::_1));
+    sub_pcl = this->node->create_subscription<livox_custom_msg::CustomMsg>(lid_topic, kLidarSubscriptionDepth, std::bind(&LIVMapper::livox_pcl_cbk, this, std::placeholders::_1));
 #endif
   } else {
-    sub_pcl = this->node->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, 200000, std::bind(&LIVMapper::standard_pcl_cbk, this, std::placeholders::_1));
+    sub_pcl = this->node->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, kLidarSubscriptionDepth, std::bind(&LIVMapper::standard_pcl_cbk, this, std::placeholders::_1));
   }
-  sub_imu = this->node->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 200000, std::bind(&LIVMapper::imu_cbk, this, std::placeholders::_1));
+  sub_imu = this->node->create_subscription<sensor_msgs::msg::Imu>(imu_topic, kImuSubscriptionDepth, std::bind(&LIVMapper::imu_cbk, this, std::placeholders::_1));
   sub_img = this->node->create_subscription<sensor_msgs::msg::Image>(img_topic, 200000, std::bind(&LIVMapper::img_cbk, this, std::placeholders::_1));
   
   pubLaserCloudFullRes = this->node->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 100);
@@ -516,9 +526,10 @@ void LIVMapper::handleVIO()
 void LIVMapper::handleLIO() 
 {    
   euler_cur = RotMtoEuler(_state.rot_end);
+  // 保留逐帧调试轨迹但不使用 endl 强制刷盘，避免 10 Hz 文件 flush 竞争实时处理。
   fout_pre << setw(20) << LidarMeasures.last_lio_update_time - _first_lidar_time << " " << euler_cur.transpose() * 57.3 << " "
            << _state.pos_end.transpose() << " " << _state.vel_end.transpose() << " " << _state.bias_g.transpose() << " "
-           << _state.bias_a.transpose() << " " << V3D(_state.inv_expo_time, 0, 0).transpose() << endl;
+           << _state.bias_a.transpose() << " " << V3D(_state.inv_expo_time, 0, 0).transpose() << '\n';
            
   if (feats_undistort->empty() || (feats_undistort == nullptr)) 
   {
@@ -602,7 +613,6 @@ void LIVMapper::handleLIO()
     voxelmap_manager->pv_list_[i].var = var;
   }
   voxelmap_manager->UpdateVoxelMap(voxelmap_manager->pv_list_);
-  std::cout << "[ LIO ] Update Voxel Map" << std::endl;
   _pv_list = voxelmap_manager->pv_list_;
   
   double t4 = omp_get_wtime();
@@ -642,23 +652,14 @@ void LIVMapper::handleLIO()
   // printf("\033[1;36m[ LIO mapping time ]: current scan: icp: %0.6f secs, map incre: %0.6f secs, total: %0.6f secs.\033[0m\n"
   //         "\033[1;36m[ LIO mapping time ]: average: icp: %0.6f secs, map incre: %0.6f secs, total: %0.6f secs.\033[0m\n",
   //         t2 - t1, t4 - t3, t4 - t0, aver_time_icp, aver_time_map_inre, aver_time_consu);
-  printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");
-  printf("\033[1;34m|                         LIO Mapping Time                    |\033[0m\n");
-  printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");
-  printf("\033[1;34m| %-29s | %-27s |\033[0m\n", "Algorithm Stage", "Time (secs)");
-  printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");
-  printf("\033[1;36m| %-29s | %-27f |\033[0m\n", "DownSample", t_down - t0);
-  printf("\033[1;36m| %-29s | %-27f |\033[0m\n", "ICP", t2 - t1);
-  printf("\033[1;36m| %-29s | %-27f |\033[0m\n", "updateVoxelMap", t4 - t3);
-  printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");
-  printf("\033[1;36m| %-29s | %-27f |\033[0m\n", "Current Total Time", t4 - t0);
-  printf("\033[1;36m| %-29s | %-27f |\033[0m\n", "Average Total Time", aver_time_consu);
-  printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");
+  RCLCPP_INFO_THROTTLE(this->node->get_logger(), *this->node->get_clock(), kRuntimeLogThrottleMs,
+                       "LIO timing: downsample=%.6f s, ICP=%.6f s, map=%.6f s, total=%.6f s, average=%.6f s",
+                       t_down - t0, t2 - t1, t4 - t3, t4 - t0, aver_time_consu);
 
   euler_cur = RotMtoEuler(_state.rot_end);
   fout_out << std::setw(20) << LidarMeasures.last_lio_update_time - _first_lidar_time << " " << euler_cur.transpose() * 57.3 << " "
             << _state.pos_end.transpose() << " " << _state.vel_end.transpose() << " " << _state.bias_g.transpose() << " "
-            << _state.bias_a.transpose() << " " << V3D(_state.inv_expo_time, 0, 0).transpose() << " " << feats_undistort->points.size() << std::endl;
+            << _state.bias_a.transpose() << " " << V3D(_state.inv_expo_time, 0, 0).transpose() << " " << feats_undistort->points.size() << '\n';
 }
 
 void LIVMapper::savePCD() 
@@ -900,7 +901,6 @@ void LIVMapper::standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::ConstShare
     RCLCPP_ERROR(this->node->get_logger(),"lidar loop back, clear buffer");
     lid_raw_data_buffer.clear();
   }
-  // ROS_INFO("get point cloud at time: %.6f", stamp2Sec(msg->header.stamp));
   PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
   p_pre->process(msg, ptr);
   lid_raw_data_buffer.push_back(ptr);
@@ -922,21 +922,12 @@ void LIVMapper::livox_pcl_cbk(const livox_custom_msg::CustomMsg::ConstSharedPtr 
   //   sync_jump_flag = true;
   //   msg->header.stamp = rclcpp::Time().fromSec(last_timestamp_lidar + 0.1);
   // }
-  if (abs(last_timestamp_imu - stamp2Sec(msg->header.stamp)) > 1.0 && !imu_buffer.empty())
-  {
-    double timediff_imu_wrt_lidar = last_timestamp_imu - stamp2Sec(msg->header.stamp);
-    RCLCPP_INFO(this->node->get_logger(), "\033[95mSelf sync IMU and LiDAR, HARD time lag is %.10lf \n\033[0m", timediff_imu_wrt_lidar - 0.100);
-    // imu_time_offset = timediff_imu_wrt_lidar;
-  }
-
   double cur_head_time = stamp2Sec(msg->header.stamp);
-  RCLCPP_INFO(this->node->get_logger(), "Get LiDAR, its header time: %.6f", cur_head_time);
   if (cur_head_time < last_timestamp_lidar)
   {
     RCLCPP_ERROR(this->node->get_logger(), "lidar loop back, clear buffer");
     lid_raw_data_buffer.clear();
   }
-  RCLCPP_INFO(this->node->get_logger(), "get point cloud at time: %.6f", stamp2Sec(msg->header.stamp));
   PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
   p_pre->process(msg, ptr);
 
@@ -983,14 +974,18 @@ void LIVMapper::imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in)
   if (!imu_en) return;
 
   if (last_timestamp_lidar < 0.0) return;
-  RCLCPP_INFO(this->node->get_logger(), "get imu at time: %.6f", stamp2Sec(msg_in->header.stamp));
+  // 200 Hz callback 不能执行逐样本 I/O；异常仍由下方节流 WARN 保持可观测。
   sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
   msg->header.stamp = sec2Stamp(stamp2Sec(msg->header.stamp) - imu_time_offset);
   double timestamp = stamp2Sec(msg->header.stamp);
 
   if (fabs(last_timestamp_lidar - timestamp) > 0.5 && (!ros_driver_fix_en))
   {
-    RCLCPP_WARN(this->node->get_logger(), "IMU and LiDAR not synced! delta time: %lf .\n", last_timestamp_lidar - timestamp);
+    ++imu_lidar_sync_warning_count;
+    RCLCPP_WARN_THROTTLE(this->node->get_logger(), *this->node->get_clock(), kRuntimeLogThrottleMs,
+                         "IMU and LiDAR not synced! delta time: %.6f s, count: %zu, IMU buffer: %zu, LiDAR buffer: %zu",
+                         last_timestamp_lidar - timestamp, imu_lidar_sync_warning_count,
+                         imu_buffer.size(), lid_raw_data_buffer.size());
   }
 
   if (ros_driver_fix_en) timestamp += std::round(last_timestamp_lidar - timestamp);
@@ -1015,7 +1010,6 @@ void LIVMapper::imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in)
   last_timestamp_imu = timestamp;
 
   imu_buffer.push_back(msg);
-  cout<<"got imu: "<<timestamp<<" imu size "<<imu_buffer.size()<<endl;
   mtx_buffer.unlock();
   {
     mtx_buffer_imu_prop.lock();

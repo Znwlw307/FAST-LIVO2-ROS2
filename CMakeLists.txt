@@ -216,6 +216,15 @@ install(
   DESTINATION share/${PROJECT_NAME}
 )
 
+if(BUILD_TESTING)
+  add_test(
+    NAME realtime_backlog_contract
+    COMMAND ${CMAKE_COMMAND}
+      -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/test/realtime_backlog_contract.cmake
+  )
+endif()
+
 # Export dependencies
 ament_export_dependencies(
   rclcpp
