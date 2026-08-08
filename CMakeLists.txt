@@ -118,7 +118,6 @@ include_directories(
   ${EIGEN3_INCLUDE_DIR}
   ${PCL_INCLUDE_DIRS}
   ${OpenCV_INCLUDE_DIRS}
-  ${Sophus_INCLUDE_DIRS}
   ${vikit_common_INCLUDE_DIRS}
   ${vikit_ros_INCLUDE_DIRS}
   include
@@ -146,7 +145,7 @@ if(livox_interfaces_FOUND)
   list(APPEND dependencies livox_interfaces)
 endif()
 
-set(COMMON_DEPENDENCIES OpenMP::OpenMP_CXX fmt::fmt)
+set(COMMON_DEPENDENCIES OpenMP::OpenMP_CXX fmt::fmt Sophus::Sophus)
 
 # link_directories(${COMMON_DEPENDENCIES}
 #   ${vikit_common_LIBRARIES}/libvikit_common.so
@@ -196,7 +195,6 @@ target_link_libraries(fastlivo_mapping
   imu_proc
   ${PCL_LIBRARIES}
   ${OpenCV_LIBRARIES}
-  ${Sophus_LIBRARIES}
   ${Boost_LIBRARIES}
 )
 
@@ -217,6 +215,12 @@ install(
 )
 
 if(BUILD_TESTING)
+  add_test(
+    NAME sophus_dependency_contract
+    COMMAND ${CMAKE_COMMAND}
+      -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/test/sophus_dependency_contract.cmake
+  )
   add_test(
     NAME realtime_backlog_contract
     COMMAND ${CMAKE_COMMAND}
