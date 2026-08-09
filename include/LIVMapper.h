@@ -13,6 +13,9 @@ which is included as part of this source code package.
 #ifndef LIV_MAPPER_H
 #define LIV_MAPPER_H
 
+#include <chrono>
+#include <cstdint>
+
 #include "IMU_Processing.h"
 #include "vio.h"
 #include "preprocess.h"
@@ -65,6 +68,8 @@ public:
   void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr &pmavros_pose_publisherubOdomAftMapped);
   void publish_mavros(const rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr &mavros_pose_publisher);
   void publish_path(const rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr &pubPath);
+  void recordPublishedMessage(std::uint64_t &count);
+  void printPublishRateSummary() const;
   void readParameters(rclcpp::Node::SharedPtr &node);
   template <typename T> void set_posestamp(T &out);
   template <typename T> void pointBodyToWorld(const Eigen::Matrix<T, 3, 1> &pi, Eigen::Matrix<T, 3, 1> &po);
@@ -215,5 +220,9 @@ public:
   double aver_time_icp = 0;
   double aver_time_map_inre = 0;
   bool colmap_output_en = false;
+  std::uint64_t odometry_published_count = 0;
+  std::uint64_t cloud_published_count = 0;
+  std::chrono::steady_clock::time_point rate_window_start;
+  bool rate_window_started = false;
 };
 #endif

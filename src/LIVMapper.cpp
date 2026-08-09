@@ -731,6 +731,7 @@ void LIVMapper::run(rclcpp::Node::SharedPtr &node)
 
     stateEstimationAndMapping();
   }
+  printPublishRateSummary();
   savePCD();
 }
 
@@ -1402,6 +1403,7 @@ void LIVMapper::publish_frame_world(const rclcpp::Publisher<sensor_msgs::msg::Po
   laserCloudmsg.header.stamp = this->node->get_clock()->now(); //.fromSec(last_timestamp_lidar);
   laserCloudmsg.header.frame_id = "camera_init";
   pubLaserCloudFullRes->publish(laserCloudmsg);
+  recordPublishedMessage(cloud_published_count);
 
   /**************** save map ****************/
   /* 1. make sure you have enough memories
@@ -1567,6 +1569,44 @@ void LIVMapper::publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry
   transform.setRotation(q);
   br->sendTransform(geometry_msgs::msg::TransformStamped(createTransformStamped(transform, odomAftMapped.header.stamp, "camera_init", "aft_mapped")));
   pubOdomAftMapped->publish(odomAftMapped);
+  recordPublishedMessage(odometry_published_count);
+}
+
+void LIVMapper::recordPublishedMessage(std::uint64_t &count)
+{
+  // 两路输出都由主 run loop 串行发布；首次成功 publish 冻结共同 steady 观察窗口。
+  if (!rate_window_started)
+  {
+    rate_window_start = std::chrono::steady_clock::now();
+    rate_window_started = true;
+  }
+  ++count;
+}
+
+void LIVMapper::printPublishRateSummary() const
+{
+  const auto now = std::chrono::steady_clock::now();
+  const double window_start_s = rate_window_started
+      ? std::chrono::duration<double>(rate_window_start.time_since_epoch()).count()
+      : 0.0;
+  const double duration_s = rate_window_started
+      ? std::chrono::duration<double>(now - rate_window_start).count()
+      : 0.0;
+  const double odometry_rate_hz = duration_s > 0.0
+      ? static_cast<double>(odometry_published_count) / duration_s
+      : 0.0;
+  const double cloud_rate_hz = duration_s > 0.0
+      ? static_cast<double>(cloud_published_count) / duration_s
+      : 0.0;
+
+  // 只在 run loop 退出后打印一次，避免为实时 publish 路径增加逐消息 I/O。
+  std::cout << std::fixed << std::setprecision(6)
+            << "ODOMETRY_PUBLISHED_COUNT=" << odometry_published_count << '\n'
+            << "CLOUD_PUBLISHED_COUNT=" << cloud_published_count << '\n'
+            << "RATE_WINDOW_START=" << window_start_s << '\n'
+            << "RATE_WINDOW_DURATION=" << duration_s << '\n'
+            << "FAST_LIVO2_PRODUCER_ODOMETRY_RATE_HZ=" << odometry_rate_hz << '\n'
+            << "FAST_LIVO2_PRODUCER_CLOUD_RATE_HZ=" << cloud_rate_hz << std::endl;
 }
 
 void LIVMapper::publish_mavros(const rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr &mavros_pose_publisher)
