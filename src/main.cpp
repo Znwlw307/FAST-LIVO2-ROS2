@@ -9,6 +9,6 @@ int main(int argc, char **argv)
   LIVMapper mapper(nh, "laserMapping");
   mapper.initializeSubscribersAndPublishers(nh, it_);
   mapper.run(nh);
-  rclcpp::shutdown();
+  if (rclcpp::ok()) rclcpp::shutdown();
   return 0;
 }

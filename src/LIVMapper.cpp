@@ -332,6 +332,7 @@ void LIVMapper::initializeSubscribersAndPublishers(rclcpp::Node::SharedPtr &node
   pubLaserCloudDynRmed = this->node->create_publisher<sensor_msgs::msg::PointCloud2>("/dyn_obj_removed", 100);
   pubLaserCloudDynDbg = this->node->create_publisher<sensor_msgs::msg::PointCloud2>("/dyn_obj_dbg_hist", 100);
   mavros_pose_publisher = this->node->create_publisher<geometry_msgs::msg::PoseStamped>("/mavros/vision_pose/pose", 10);
+  transform_broadcaster = std::make_shared<tf2_ros::TransformBroadcaster>(this->node);
   pubImage = it.advertise("/rgb_img", 1);
   pubImuPropOdom = this->node->create_publisher<nav_msgs::msg::Odometry>("/LIVO2/imu_propagate", 10000);
   imu_prop_timer = this->node->create_wall_timer(0.004s, std::bind(&LIVMapper::imu_prop_callback, this));
@@ -729,7 +730,19 @@ void LIVMapper::run(rclcpp::Node::SharedPtr &node)
 
     // if (!p_imu->imu_time_init) continue;
 
-    stateEstimationAndMapping();
+    try
+    {
+      stateEstimationAndMapping();
+    }
+    catch (const rclcpp::exceptions::RCLError &error)
+    {
+      // A signal may invalidate the ROS context while the current LIO frame is
+      // finishing. Only that controlled shutdown race is normal; an RCLError
+      // while the context is still valid remains a runtime failure.
+      if (rclcpp::ok()) throw;
+      std::cerr << "FAST_LIVO2_CONTROLLED_SHUTDOWN=" << error.what() << std::endl;
+      break;
+    }
   }
   printPublishRateSummary();
   savePCD();
@@ -1557,8 +1570,6 @@ void LIVMapper::publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry
   odomAftMapped.header.stamp = this->node->get_clock()->now(); //.ros::Time()fromSec(last_timestamp_lidar);
   set_posestamp(odomAftMapped.pose.pose);
 
-  static std::shared_ptr<tf2_ros::TransformBroadcaster> br;
-  br = std::make_shared<tf2_ros::TransformBroadcaster>(this->node);
   tf2::Transform transform;
   tf2::Quaternion q;
   transform.setOrigin(tf2::Vector3(_state.pos_end(0), _state.pos_end(1), _state.pos_end(2)));
@@ -1567,7 +1578,7 @@ void LIVMapper::publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry
   q.setY(geoQuat.y);
   q.setZ(geoQuat.z);
   transform.setRotation(q);
-  br->sendTransform(geometry_msgs::msg::TransformStamped(createTransformStamped(transform, odomAftMapped.header.stamp, "camera_init", "aft_mapped")));
+  transform_broadcaster->sendTransform(geometry_msgs::msg::TransformStamped(createTransformStamped(transform, odomAftMapped.header.stamp, "camera_init", "aft_mapped")));
   pubOdomAftMapped->publish(odomAftMapped);
   recordPublishedMessage(odometry_published_count);
 }
