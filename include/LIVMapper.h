@@ -28,6 +28,7 @@ which is included as part of this source code package.
 #include <tf2_ros/transform_broadcaster.h>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <nav_msgs/msg/path.hpp>
+#include <std_srvs/srv/trigger.hpp>
 #include <vikit/camera_loader.h>
 
 class LIVMapper
@@ -69,6 +70,9 @@ public:
   void publish_mavros(const rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr &mavros_pose_publisher);
   void publish_path(const rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr &pubPath);
   void recordPublishedMessage(std::uint64_t &count);
+  void publishCounterSnapshot(
+      const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+      std::shared_ptr<std_srvs::srv::Trigger::Response> response) const;
   void printPublishRateSummary() const;
   void readParameters(rclcpp::Node::SharedPtr &node);
   template <typename T> void set_posestamp(T &out);
@@ -214,6 +218,7 @@ public:
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr mavros_pose_publisher;
   std::shared_ptr<tf2_ros::TransformBroadcaster> transform_broadcaster;
   rclcpp::TimerBase::SharedPtr imu_prop_timer;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr shutdown_counter_service;
   rclcpp::Node::SharedPtr node;
 
   int frame_num = 0;

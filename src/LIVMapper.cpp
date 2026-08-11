@@ -295,6 +295,12 @@ void LIVMapper::initializeFiles()
 void LIVMapper::initializeSubscribersAndPublishers(rclcpp::Node::SharedPtr &node, image_transport::ImageTransport &it_)
 {
   image_transport::ImageTransport it(this->node);
+  // 只读 service 与 publish counter 共用单线程 executor，因此响应是同一提交边界的
+  // 权威快照；不增加热路径 I/O，也不改变 FAST-LIVO2 算法或发布语义。
+  shutdown_counter_service = this->node->create_service<std_srvs::srv::Trigger>(
+      "~/shutdown_counts",
+      std::bind(&LIVMapper::publishCounterSnapshot, this,
+                std::placeholders::_1, std::placeholders::_2));
   if (p_pre->lidar_type == AVIA || p_pre->lidar_type == MID360) {
 #if defined(USE_LIVOX_ROS_DRIVER2) && defined(USE_LIVOX_INTERFACES)
     // Both livox msg packages available — use livox_msg_type param to select
@@ -1592,6 +1598,18 @@ void LIVMapper::recordPublishedMessage(std::uint64_t &count)
     rate_window_started = true;
   }
   ++count;
+}
+
+void LIVMapper::publishCounterSnapshot(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+    std::shared_ptr<std_srvs::srv::Trigger::Response> response) const
+{
+  static_cast<void>(request);
+  response->success = true;
+  response->message =
+      "SCHEMA_VERSION=1;ROLE=PRODUCER;ODOMETRY_COUNT=" +
+      std::to_string(odometry_published_count) + ";CLOUD_COUNT=" +
+      std::to_string(cloud_published_count);
 }
 
 void LIVMapper::printPublishRateSummary() const

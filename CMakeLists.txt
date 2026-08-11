@@ -82,6 +82,7 @@ find_package(rclpy REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(pcl_ros REQUIRED)
 find_package(pcl_conversions REQUIRED)
@@ -129,6 +130,7 @@ set(dependencies
   geometry_msgs
   nav_msgs
   sensor_msgs
+  std_srvs
   visualization_msgs
   cv_bridge
   vikit_common
