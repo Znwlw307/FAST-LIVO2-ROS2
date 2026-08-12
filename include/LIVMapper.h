@@ -70,6 +70,14 @@ public:
   void publish_mavros(const rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr &mavros_pose_publisher);
   void publish_path(const rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr &pubPath);
   void recordPublishedMessage(std::uint64_t &count);
+  bool beginInputCallback(bool enabled);
+  void endInputCallback();
+  std::size_t pendingLidarFrameCount() const;
+  bool producerIdle() const;
+  std::string producerSnapshot() const;
+  void requestProducerQuiescence(
+      const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+      std::shared_ptr<std_srvs::srv::Trigger::Response> response);
   void publishCounterSnapshot(
       const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
       std::shared_ptr<std_srvs::srv::Trigger::Response> response) const;
@@ -219,6 +227,7 @@ public:
   std::shared_ptr<tf2_ros::TransformBroadcaster> transform_broadcaster;
   rclcpp::TimerBase::SharedPtr imu_prop_timer;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr shutdown_counter_service;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr producer_quiesce_service;
   rclcpp::Node::SharedPtr node;
 
   int frame_num = 0;
@@ -228,6 +237,12 @@ public:
   bool colmap_output_en = false;
   std::uint64_t odometry_published_count = 0;
   std::uint64_t cloud_published_count = 0;
+  std::uint64_t input_sequence = 0;
+  std::uint64_t completed_frame_sequence = 0;
+  std::uint64_t rejected_input_after_quiesce_count = 0;
+  std::size_t input_callback_active_count = 0;
+  bool input_admission_open = true;
+  bool lio_frame_inflight = false;
   std::chrono::steady_clock::time_point rate_window_start;
   bool rate_window_started = false;
 };

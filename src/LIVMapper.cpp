@@ -301,6 +301,10 @@ void LIVMapper::initializeSubscribersAndPublishers(rclcpp::Node::SharedPtr &node
       "~/shutdown_counts",
       std::bind(&LIVMapper::publishCounterSnapshot, this,
                 std::placeholders::_1, std::placeholders::_2));
+  producer_quiesce_service = this->node->create_service<std_srvs::srv::Trigger>(
+      "~/prepare_shutdown",
+      std::bind(&LIVMapper::requestProducerQuiescence, this,
+                std::placeholders::_1, std::placeholders::_2));
   if (p_pre->lidar_type == AVIA || p_pre->lidar_type == MID360) {
 #if defined(USE_LIVOX_ROS_DRIVER2) && defined(USE_LIVOX_INTERFACES)
     // Both livox msg packages available — use livox_msg_type param to select
@@ -730,6 +734,7 @@ void LIVMapper::run(rclcpp::Node::SharedPtr &node)
       rate.sleep();
       continue;
     }
+    lio_frame_inflight = true;
     handleFirstFrame();
 
     processImu();
@@ -739,9 +744,12 @@ void LIVMapper::run(rclcpp::Node::SharedPtr &node)
     try
     {
       stateEstimationAndMapping();
+      lio_frame_inflight = false;
+      ++completed_frame_sequence;
     }
     catch (const rclcpp::exceptions::RCLError &error)
     {
+      lio_frame_inflight = false;
       // A signal may invalidate the ROS context while the current LIO frame is
       // finishing. Only that controlled shutdown race is normal; an RCLError
       // while the context is still valid remains a runtime failure.
@@ -911,7 +919,7 @@ void LIVMapper::RGBpointBodyLidarToIMU(PointType const *const pi, PointType *con
 
 void LIVMapper::standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg)
 {
-  if (!lidar_en) return;
+  if (!beginInputCallback(lidar_en)) return;
   mtx_buffer.lock();
 
   double cur_head_time = stamp2Sec(msg->header.stamp) + lidar_time_offset;
@@ -929,11 +937,12 @@ void LIVMapper::standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::ConstShare
 
   mtx_buffer.unlock();
   sig_buffer.notify_all();
+  endInputCallback();
 }
 
 void LIVMapper::livox_pcl_cbk(const livox_custom_msg::CustomMsg::ConstSharedPtr &msg_in)
 {
-  if (!lidar_en) return;
+  if (!beginInputCallback(lidar_en)) return;
   mtx_buffer.lock();
   livox_custom_msg::CustomMsg::SharedPtr msg(new livox_custom_msg::CustomMsg(*msg_in));
   // if ((abs(stamp2Sec(msg->header.stamp) - last_timestamp_lidar) > 0.2 && last_timestamp_lidar > 0) || sync_jump_flag)
@@ -954,6 +963,7 @@ void LIVMapper::livox_pcl_cbk(const livox_custom_msg::CustomMsg::ConstSharedPtr 
   if (!ptr || ptr->empty()) {
     RCLCPP_ERROR(this->node->get_logger(), "Received an empty point cloud");
     mtx_buffer.unlock();
+    endInputCallback();
     return;
   }
 
@@ -963,11 +973,19 @@ void LIVMapper::livox_pcl_cbk(const livox_custom_msg::CustomMsg::ConstSharedPtr 
 
   mtx_buffer.unlock();
   sig_buffer.notify_all();
+  endInputCallback();
 }
 
 #if defined(USE_LIVOX_ROS_DRIVER2) && defined(USE_LIVOX_INTERFACES)
 void LIVMapper::livox_interfaces_pcl_cbk(const livox_interfaces::msg::CustomMsg::ConstSharedPtr &msg_in)
 {
+  if (!lidar_en) return;
+  if (!input_admission_open)
+  {
+    ++input_sequence;
+    ++rejected_input_after_quiesce_count;
+    return;
+  }
   // Convert livox_interfaces::msg::CustomMsg to livox_ros_driver2::msg::CustomMsg
   auto converted = std::make_shared<livox_custom_msg::CustomMsg>();
   converted->header = msg_in->header;
@@ -991,9 +1009,13 @@ void LIVMapper::livox_interfaces_pcl_cbk(const livox_interfaces::msg::CustomMsg:
 
 void LIVMapper::imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in)
 {
-  if (!imu_en) return;
+  if (!beginInputCallback(imu_en)) return;
 
-  if (last_timestamp_lidar < 0.0) return;
+  if (last_timestamp_lidar < 0.0)
+  {
+    endInputCallback();
+    return;
+  }
   // 200 Hz callback 不能执行逐样本 I/O；异常仍由下方节流 WARN 保持可观测。
   sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
   msg->header.stamp = sec2Stamp(stamp2Sec(msg->header.stamp) - imu_time_offset);
@@ -1018,6 +1040,7 @@ void LIVMapper::imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in)
     mtx_buffer.unlock();
     sig_buffer.notify_all();
     RCLCPP_ERROR(this->node->get_logger(), "imu loop back, offset: %lf \n", last_timestamp_imu - timestamp);
+    endInputCallback();
     return;
   }
 
@@ -1039,6 +1062,7 @@ void LIVMapper::imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in)
     mtx_buffer_imu_prop.unlock();
   }
   sig_buffer.notify_all();
+  endInputCallback();
 }
 
 cv::Mat LIVMapper::getImageFromMsg(const sensor_msgs::msg::Image::ConstSharedPtr &img_msg)
@@ -1051,7 +1075,7 @@ cv::Mat LIVMapper::getImageFromMsg(const sensor_msgs::msg::Image::ConstSharedPtr
 // static int i = 0;
 void LIVMapper::img_cbk(const sensor_msgs::msg::Image::ConstSharedPtr &msg_in)
 {
-  if (!img_en) return;
+  if (!beginInputCallback(img_en)) return;
   sensor_msgs::msg::Image::SharedPtr msg(new sensor_msgs::msg::Image(*msg_in));
   // if ((abs(stamp2Sec(msg->header.stamp) - last_timestamp_img) > 0.2 && last_timestamp_img > 0) || sync_jump_flag)
   // {
@@ -1064,17 +1088,30 @@ void LIVMapper::img_cbk(const sensor_msgs::msg::Image::ConstSharedPtr &msg_in)
   if (hilti_en)
   {
     static int frame_counter = 0;
-    if (++frame_counter % 4 != 0) return;
+    if (++frame_counter % 4 != 0)
+    {
+      endInputCallback();
+      return;
+    }
   }
   // double msg_header_time =  stamp2Sec(msg->header.stamp);
   double msg_header_time = stamp2Sec(msg->header.stamp) + img_time_offset;
-  if (abs(msg_header_time - last_timestamp_img) < 0.001) return;
+  if (abs(msg_header_time - last_timestamp_img) < 0.001)
+  {
+    endInputCallback();
+    return;
+  }
   RCLCPP_INFO(this->node->get_logger(), "Get image, its header time: %.6f", msg_header_time);
-  if (last_timestamp_lidar < 0) return;
+  if (last_timestamp_lidar < 0)
+  {
+    endInputCallback();
+    return;
+  }
 
   if (msg_header_time < last_timestamp_img)
   {
     RCLCPP_ERROR(this->node->get_logger(), "image loop back. \n");
+    endInputCallback();
     return;
   }
 
@@ -1087,6 +1124,7 @@ void LIVMapper::img_cbk(const sensor_msgs::msg::Image::ConstSharedPtr &msg_in)
     RCLCPP_WARN(this->node->get_logger(), "Image need Jumps: %.6f", img_time_correct);
     mtx_buffer.unlock();
     sig_buffer.notify_all();
+    endInputCallback();
     return;
   }
 
@@ -1102,6 +1140,7 @@ void LIVMapper::img_cbk(const sensor_msgs::msg::Image::ConstSharedPtr &msg_in)
   // cout<<"last_timestamp_img:::"<<last_timestamp_img<<endl;
   mtx_buffer.unlock();
   sig_buffer.notify_all();
+  endInputCallback();
 }
 
 bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
@@ -1600,16 +1639,82 @@ void LIVMapper::recordPublishedMessage(std::uint64_t &count)
   ++count;
 }
 
+bool LIVMapper::beginInputCallback(bool enabled)
+{
+  if (!enabled) return false;
+  ++input_sequence;
+  if (!input_admission_open)
+  {
+    ++rejected_input_after_quiesce_count;
+    return false;
+  }
+  ++input_callback_active_count;
+  return true;
+}
+
+void LIVMapper::endInputCallback()
+{
+  if (input_callback_active_count > 0) --input_callback_active_count;
+}
+
+std::size_t LIVMapper::pendingLidarFrameCount() const
+{
+  const bool pending_livo_vio =
+      slam_mode_ == LIVO && LidarMeasures.lio_vio_flg == LIO;
+  return lid_raw_data_buffer.size() + (pending_livo_vio ? 1U : 0U);
+}
+
+bool LIVMapper::producerIdle() const
+{
+  return !input_admission_open && input_callback_active_count == 0 &&
+         !lio_frame_inflight && pendingLidarFrameCount() == 0;
+}
+
+std::string LIVMapper::producerSnapshot() const
+{
+  const bool context_alive = rclcpp::ok();
+  const bool publisher_alive = pubOdomAftMapped && pubLaserCloudFullRes;
+  return
+      "SCHEMA_VERSION=2;ROLE=PRODUCER;ODOMETRY_COUNT=" +
+      std::to_string(odometry_published_count) + ";CLOUD_COUNT=" +
+      std::to_string(cloud_published_count) + ";INPUT_ADMISSION_OPEN=" +
+      (input_admission_open ? "true" : "false") +
+      ";INPUT_CALLBACK_ACTIVE_COUNT=" +
+      std::to_string(input_callback_active_count) + ";LIO_FRAME_INFLIGHT=" +
+      (lio_frame_inflight ? "true" : "false") +
+      ";PENDING_LIDAR_FRAME_COUNT=" +
+      std::to_string(pendingLidarFrameCount()) +
+      ";PENDING_FINAL_PUBLICATION=" +
+      (lio_frame_inflight ? "true" : "false") +
+      ";LAST_INPUT_SEQUENCE=" + std::to_string(input_sequence) +
+      ";LAST_COMPLETED_FRAME_SEQUENCE=" +
+      std::to_string(completed_frame_sequence) +
+      ";REJECTED_INPUT_AFTER_QUIESCE_COUNT=" +
+      std::to_string(rejected_input_after_quiesce_count) +
+      ";PRODUCER_IDLE=" + (producerIdle() ? "true" : "false") +
+      ";ROS_CONTEXT_ALIVE=" + (context_alive ? "true" : "false") +
+      ";PUBLISHER_ALIVE=" + (publisher_alive ? "true" : "false");
+}
+
+void LIVMapper::requestProducerQuiescence(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+    std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+{
+  static_cast<void>(request);
+  // 该 service 只能在外层确认 Livox/input owner 已退出后调用；关闭准入但保留
+  // node、publisher 和 DataWriter，使已准入的 LIO frame 能完成并被下游排空。
+  input_admission_open = false;
+  response->success = true;
+  response->message = producerSnapshot();
+}
+
 void LIVMapper::publishCounterSnapshot(
     const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
     std::shared_ptr<std_srvs::srv::Trigger::Response> response) const
 {
   static_cast<void>(request);
   response->success = true;
-  response->message =
-      "SCHEMA_VERSION=1;ROLE=PRODUCER;ODOMETRY_COUNT=" +
-      std::to_string(odometry_published_count) + ";CLOUD_COUNT=" +
-      std::to_string(cloud_published_count);
+  response->message = producerSnapshot();
 }
 
 void LIVMapper::printPublishRateSummary() const

@@ -241,6 +241,12 @@ if(BUILD_TESTING)
       -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
       -P ${CMAKE_CURRENT_SOURCE_DIR}/test/controlled_shutdown_contract.cmake
   )
+  add_test(
+    NAME producer_quiescence_contract
+    COMMAND ${CMAKE_COMMAND}
+      -DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/test/producer_quiescence_contract.cmake
+  )
 endif()
 
 # Export dependencies
