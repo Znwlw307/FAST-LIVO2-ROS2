@@ -12,6 +12,10 @@ which is included as part of this source code package.
 
 #include "LIVMapper.h"
 #include <cstddef>
+#include <exception>
+#include <limits>
+#include <thread>
+#include <rclcpp/executors/single_threaded_executor.hpp>
 #include <vikit/camera_loader.h>
 
 using namespace Sophus;
@@ -22,6 +26,15 @@ namespace
 constexpr std::size_t kLidarSubscriptionDepth = 10;
 constexpr std::size_t kImuSubscriptionDepth = 200;
 constexpr int kRuntimeLogThrottleMs = 1000;
+constexpr double kImuGapThresholdSeconds = 0.2;
+
+void updateMaximum(std::atomic<double> &maximum, const double value)
+{
+  double previous = maximum.load(std::memory_order_relaxed);
+  while (value > previous &&
+         !maximum.compare_exchange_weak(previous, value,
+                                        std::memory_order_relaxed)) {}
+}
 }
 
 LIVMapper::LIVMapper(rclcpp::Node::SharedPtr &node, std::string node_name)
@@ -295,6 +308,10 @@ void LIVMapper::initializeFiles()
 void LIVMapper::initializeSubscribersAndPublishers(rclcpp::Node::SharedPtr &node, image_transport::ImageTransport &it_)
 {
   image_transport::ImageTransport it(this->node);
+  sensor_callback_group = this->node->create_callback_group(
+      rclcpp::CallbackGroupType::MutuallyExclusive, false);
+  rclcpp::SubscriptionOptions sensor_options;
+  sensor_options.callback_group = sensor_callback_group;
   // 只读 service 与 publish counter 共用单线程 executor，因此响应是同一提交边界的
   // 权威快照；不增加热路径 I/O，也不改变 FAST-LIVO2 算法或发布语义。
   shutdown_counter_service = this->node->create_service<std_srvs::srv::Trigger>(
@@ -314,20 +331,20 @@ void LIVMapper::initializeSubscribersAndPublishers(rclcpp::Node::SharedPtr &node
     this->node->get_parameter("common.livox_msg_type", livox_msg_type);
 
     if (livox_msg_type == "livox_interfaces") {
-      sub_pcl = this->node->create_subscription<livox_interfaces::msg::CustomMsg>(lid_topic, kLidarSubscriptionDepth, std::bind(&LIVMapper::livox_interfaces_pcl_cbk, this, std::placeholders::_1));
+      sub_pcl = this->node->create_subscription<livox_interfaces::msg::CustomMsg>(lid_topic, kLidarSubscriptionDepth, std::bind(&LIVMapper::livox_interfaces_pcl_ingest_cbk, this, std::placeholders::_1), sensor_options);
       RCLCPP_INFO(this->node->get_logger(), "Using livox_interfaces::msg::CustomMsg for '%s'", lid_topic.c_str());
     } else {
-      sub_pcl = this->node->create_subscription<livox_custom_msg::CustomMsg>(lid_topic, kLidarSubscriptionDepth, std::bind(&LIVMapper::livox_pcl_cbk, this, std::placeholders::_1));
+      sub_pcl = this->node->create_subscription<livox_custom_msg::CustomMsg>(lid_topic, kLidarSubscriptionDepth, std::bind(&LIVMapper::livox_pcl_ingest_cbk, this, std::placeholders::_1), sensor_options);
       RCLCPP_INFO(this->node->get_logger(), "Using livox_ros_driver2::msg::CustomMsg for '%s'", lid_topic.c_str());
     }
 #else
-    sub_pcl = this->node->create_subscription<livox_custom_msg::CustomMsg>(lid_topic, kLidarSubscriptionDepth, std::bind(&LIVMapper::livox_pcl_cbk, this, std::placeholders::_1));
+    sub_pcl = this->node->create_subscription<livox_custom_msg::CustomMsg>(lid_topic, kLidarSubscriptionDepth, std::bind(&LIVMapper::livox_pcl_ingest_cbk, this, std::placeholders::_1), sensor_options);
 #endif
   } else {
-    sub_pcl = this->node->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, kLidarSubscriptionDepth, std::bind(&LIVMapper::standard_pcl_cbk, this, std::placeholders::_1));
+    sub_pcl = this->node->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, kLidarSubscriptionDepth, std::bind(&LIVMapper::standard_pcl_ingest_cbk, this, std::placeholders::_1), sensor_options);
   }
-  sub_imu = this->node->create_subscription<sensor_msgs::msg::Imu>(imu_topic, kImuSubscriptionDepth, std::bind(&LIVMapper::imu_cbk, this, std::placeholders::_1));
-  sub_img = this->node->create_subscription<sensor_msgs::msg::Image>(img_topic, 200000, std::bind(&LIVMapper::img_cbk, this, std::placeholders::_1));
+  sub_imu = this->node->create_subscription<sensor_msgs::msg::Imu>(imu_topic, kImuSubscriptionDepth, std::bind(&LIVMapper::imu_ingest_cbk, this, std::placeholders::_1), sensor_options);
+  sub_img = this->node->create_subscription<sensor_msgs::msg::Image>(img_topic, IMAGE_QUEUE_CAPACITY, std::bind(&LIVMapper::img_ingest_cbk, this, std::placeholders::_1), sensor_options);
   
   pubLaserCloudFullRes = this->node->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 100);
   pubNormal = this->node->create_publisher<visualization_msgs::msg::MarkerArray>("/visualization_marker", 100);
@@ -345,7 +362,6 @@ void LIVMapper::initializeSubscribersAndPublishers(rclcpp::Node::SharedPtr &node
   transform_broadcaster = std::make_shared<tf2_ros::TransformBroadcaster>(this->node);
   pubImage = it.advertise("/rgb_img", 1);
   pubImuPropOdom = this->node->create_publisher<nav_msgs::msg::Odometry>("/LIVO2/imu_propagate", 10000);
-  imu_prop_timer = this->node->create_wall_timer(0.004s, std::bind(&LIVMapper::imu_prop_callback, this));
   voxelmap_manager->voxel_map_pub_= this->node->create_publisher<visualization_msgs::msg::MarkerArray>("/planes", 10000);
 }
 
@@ -395,6 +411,92 @@ void LIVMapper::processImu()
   // std::cout << "[ Mapping ] feats_undistort: " << feats_undistort->size() << std::endl;
   // std::cout << "[ Mapping ] predict cov: " << _state.cov.diagonal().transpose() << std::endl;
   // std::cout << "[ Mapping ] predict sta: " << state_propagat.pos_end.transpose() << state_propagat.vel_end.transpose() << std::endl;
+}
+
+bool LIVMapper::validateCurrentImuCoverage()
+{
+  if (!imu_en || LidarMeasures.lio_vio_flg != LIO) return true;
+  if (LidarMeasures.measures.empty()) return false;
+
+  const auto &measurement = LidarMeasures.measures.back();
+  std::vector<double> timestamps;
+  timestamps.reserve(measurement.imu.size());
+  for (const auto &imu : measurement.imu)
+    timestamps.push_back(stamp2Sec(imu->header.stamp));
+
+  const double required_start = imu_recovery_pending
+      ? LidarMeasures.lidar_frame_beg_time
+      : std::max(LidarMeasures.last_lio_update_time,
+                 LidarMeasures.lidar_frame_beg_time);
+  const double previous_timestamp =
+      last_valid_imu_timestamp >= 0.0
+          ? last_valid_imu_timestamp
+          : std::numeric_limits<double>::quiet_NaN();
+  const auto coverage = fast_livo::validateImuCoverage(
+      timestamps, required_start, measurement.lio_time, previous_timestamp,
+      imu_input_continuity_lost, kImuGapThresholdSeconds);
+  if (coverage.status != fast_livo::ImuCoverageStatus::kValid)
+  {
+    ++invalid_imu_coverage_total;
+    RCLCPP_WARN(
+        this->node->get_logger(),
+        "CURRENT_SCAN_INVALID_IMU_COVERAGE=%s max_delta_s=%.6f scan_start=%.6f scan_end=%.6f rejected_total=%llu",
+        fast_livo::imuCoverageStatusName(coverage.status),
+        coverage.maximum_delta_seconds, required_start, measurement.lio_time,
+        static_cast<unsigned long long>(invalid_imu_coverage_total.load()));
+    imu_input_continuity_lost = false;
+    imu_recovery_pending = true;
+    last_valid_imu_timestamp = -1.0;
+    return false;
+  }
+
+  if (imu_recovery_pending)
+  {
+    // gap 后只在完整新 scan coverage 已证明时重基准，绝不跨未知区间传播。
+    p_imu->RebaseAfterGap(required_start, measurement.imu.front());
+    imu_recovery_pending = false;
+  }
+  imu_input_continuity_lost = false;
+  last_valid_imu_timestamp = timestamps.back();
+  return true;
+}
+
+bool LIVMapper::validateCurrentVoxelGridInput()
+{
+  if ((LidarMeasures.lio_vio_flg != LIO && LidarMeasures.lio_vio_flg != LO) ||
+      feats_undistort->empty()) return true;
+  const auto status = fast_livo::validateVoxelGridInput(
+      *feats_undistort, filter_size_surf_min);
+  if (status == fast_livo::VoxelGridInputStatus::kSafe) return true;
+
+  ++voxel_grid_reject_total;
+  RCLCPP_ERROR(
+      this->node->get_logger(),
+      "VOXELGRID_SANITY_REJECT=%s point_count=%zu leaf_size_m=%.6f rejected_total=%llu",
+      fast_livo::voxelGridInputStatusName(status), feats_undistort->size(),
+      filter_size_surf_min,
+      static_cast<unsigned long long>(voxel_grid_reject_total.load()));
+  return false;
+}
+
+void LIVMapper::rejectCurrentMeasurement(const char *reason)
+{
+  // sync 已从 bounded input buffer 取走本帧；只清 measurement assembly，不修改
+  // voxel map 或上一份有效 estimator state。LIVO partial cloud 也必须整体退休，
+  // 否则下一帧会把 gap 两侧点重新拼接。
+  const double rejected_time = LidarMeasures.measures.empty()
+      ? LidarMeasures.last_lio_update_time
+      : LidarMeasures.measures.back().lio_time;
+  LidarMeasures.measures.clear();
+  LidarMeasures.pcl_proc_cur->clear();
+  LidarMeasures.pcl_proc_next->clear();
+  LidarMeasures.lio_vio_flg = WAIT;
+  LidarMeasures.last_lio_update_time = rejected_time;
+  lidar_pushed = false;
+  lio_frame_inflight = false;
+  RCLCPP_WARN(this->node->get_logger(),
+              "FAST_MEASUREMENT_REJECTED=%s source_time=%.6f", reason,
+              rejected_time);
 }
 
 void LIVMapper::stateEstimationAndMapping() 
@@ -723,41 +825,154 @@ void LIVMapper::savePCD()
   }
 }
 
-void LIVMapper::run(rclcpp::Node::SharedPtr &node) 
+void LIVMapper::drainSensorInputs()
 {
-  rclcpp::Rate rate(5000);
-  while (rclcpp::ok()) 
+  // 固定为 LiDAR→IMU→Image，仅建立可用的 LiDAR 时间锚后再处理 startup IMU；
+  // lambda 只在 estimator 线程执行，callback executor 从不触碰 estimator state。
+  auto lidar_batch = lidar_input_queue.drain();
+  for (auto &input : lidar_batch.items) input.consume();
+
+  // 首个 LiDAR source time 建立前保留有界 startup IMU；不能在 consumer 侧重新丢弃
+  // 已由独立 callback 及时取得的样本。
+  auto imu_batch = last_timestamp_lidar >= 0.0
+      ? imu_input_queue.drain()
+      : decltype(imu_input_queue.drain()){};
+  if (imu_batch.continuity_lost) imu_input_continuity_lost = true;
+  for (auto &input : imu_batch.items)
   {
-    rclcpp::spin_some(this->node);
-    if (!sync_packages(LidarMeasures)) 
-    {
-      rate.sleep();
-      continue;
-    }
-    lio_frame_inflight = true;
-    handleFirstFrame();
+    if (input.discontinuity_before) imu_input_continuity_lost = true;
+    if (last_imu_consumer_source_time >= 0.0)
+      updateMaximum(imu_consumer_delta_max,
+                    input.source_timestamp - last_imu_consumer_source_time);
+    last_imu_consumer_source_time = input.source_timestamp;
+    input.consume();
+  }
 
-    processImu();
+  auto image_batch = image_input_queue.drain();
+  for (auto &input : image_batch.items) input.consume();
+  printSensorInputTelemetry(false);
+}
 
-    // if (!p_imu->imu_time_init) continue;
+void LIVMapper::printSensorInputTelemetry(const bool force)
+{
+  const auto now = std::chrono::steady_clock::now();
+  if (!force && last_sensor_telemetry_time.time_since_epoch().count() != 0 &&
+      now - last_sensor_telemetry_time < std::chrono::seconds(1))
+    return;
+  last_sensor_telemetry_time = now;
+  RCLCPP_INFO(
+      this->node->get_logger(),
+      "FAST_SENSOR_INPUT IMU_SOURCE_CALLBACK_TOTAL=%llu IMU_ENQUEUED_TOTAL=%llu IMU_READER_DROP_TOTAL=%llu IMU_QUEUE_OVERFLOW_TOTAL=%llu LIDAR_CALLBACK_TOTAL=%llu LIDAR_ENQUEUED_TOTAL=%llu LIDAR_DROP_TOTAL=%llu IMU_SOURCE_DELTA_MAX=%.6f IMU_CONSUMER_DELTA_MAX=%.6f CALLBACK_RECEIVE_STEADY_TIME=%.6f IMU_QUEUE_SIZE=%zu LIDAR_QUEUE_SIZE=%zu IMAGE_QUEUE_SIZE=%zu IMAGE_QUEUE_OVERFLOW_TOTAL=%llu CURRENT_SCAN_INVALID_IMU_COVERAGE_TOTAL=%llu VOXELGRID_SANITY_REJECT_TOTAL=%llu",
+      static_cast<unsigned long long>(imu_source_callback_total.load()),
+      static_cast<unsigned long long>(imu_enqueued_total.load()),
+      static_cast<unsigned long long>(imu_reader_drop_total.load()),
+      static_cast<unsigned long long>(imu_queue_overflow_total.load()),
+      static_cast<unsigned long long>(lidar_callback_total.load()),
+      static_cast<unsigned long long>(lidar_enqueued_total.load()),
+      static_cast<unsigned long long>(lidar_drop_total.load()),
+      imu_source_delta_max.load(), imu_consumer_delta_max.load(),
+      callback_receive_steady_time.load(), imu_input_queue.size(),
+      lidar_input_queue.size(), image_input_queue.size(),
+      static_cast<unsigned long long>(image_queue_overflow_total.load()),
+      static_cast<unsigned long long>(invalid_imu_coverage_total.load()),
+      static_cast<unsigned long long>(voxel_grid_reject_total.load()));
+}
 
+void LIVMapper::run(rclcpp::Node::SharedPtr &node)
+{
+  static_cast<void>(node);
+  rclcpp::executors::SingleThreadedExecutor callback_executor;
+  callback_executor.add_callback_group(
+      sensor_callback_group, this->node->get_node_base_interface());
+  rclcpp::executors::SingleThreadedExecutor estimator_callback_executor;
+  estimator_callback_executor.add_callback_group(
+      this->node->get_node_base_interface()->get_default_callback_group(),
+      this->node->get_node_base_interface());
+  std::exception_ptr callback_failure;
+  std::thread callback_thread([&callback_executor, &callback_failure]() {
     try
     {
-      stateEstimationAndMapping();
-      lio_frame_inflight = false;
-      ++completed_frame_sequence;
+      callback_executor.spin();
     }
-    catch (const rclcpp::exceptions::RCLError &error)
+    catch (...)
     {
-      lio_frame_inflight = false;
-      // A signal may invalidate the ROS context while the current LIO frame is
-      // finishing. Only that controlled shutdown race is normal; an RCLError
-      // while the context is still valid remains a runtime failure.
-      if (rclcpp::ok()) throw;
-      std::cerr << "FAST_LIVO2_CONTROLLED_SHUTDOWN=" << error.what() << std::endl;
-      break;
+      callback_failure = std::current_exception();
+    }
+  });
+
+  rclcpp::Rate rate(5000);
+  std::exception_ptr estimator_failure;
+  auto next_imu_propagation = std::chrono::steady_clock::now();
+  try
+  {
+    while (rclcpp::ok())
+    {
+      // shutdown/counter service 与 estimator 同线程提交；sensor group 不在此 executor。
+      estimator_callback_executor.spin_some();
+      drainSensorInputs();
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= next_imu_propagation)
+      {
+        imu_prop_callback();
+        next_imu_propagation = now + std::chrono::milliseconds(4);
+      }
+      if (!sync_packages(LidarMeasures))
+      {
+        rate.sleep();
+        continue;
+      }
+      lio_frame_inflight = true;
+      handleFirstFrame();
+
+      if (!validateCurrentImuCoverage())
+      {
+        rejectCurrentMeasurement("INVALID_IMU_COVERAGE");
+        continue;
+      }
+      const StatesGroup state_before_imu_propagation = _state;
+      processImu();
+      if (!validateCurrentVoxelGridInput())
+      {
+        // ImuProcess 已推进本帧私有时间历史，因此下一份有效 coverage 必须重基准；
+        // 外层状态回滚到上一提交点，VoxelGrid/StateEstimation/MapUpdate 均未调用。
+        _state = state_before_imu_propagation;
+        state_propagat = _state;
+        voxelmap_manager->state_ = _state;
+        imu_recovery_pending = true;
+        last_valid_imu_timestamp = -1.0;
+        rejectCurrentMeasurement("UNSAFE_VOXELGRID_INPUT");
+        continue;
+      }
+
+      // if (!p_imu->imu_time_init) continue;
+
+      try
+      {
+        stateEstimationAndMapping();
+        lio_frame_inflight = false;
+        ++completed_frame_sequence;
+      }
+      catch (const rclcpp::exceptions::RCLError &error)
+      {
+        lio_frame_inflight = false;
+        // signal 只允许终止当前提交；其他 RCLError 继续作为 production failure。
+        if (rclcpp::ok()) throw;
+        std::cerr << "FAST_LIVO2_CONTROLLED_SHUTDOWN=" << error.what()
+                  << std::endl;
+        break;
+      }
     }
   }
+  catch (...)
+  {
+    estimator_failure = std::current_exception();
+  }
+
+  callback_executor.cancel();
+  if (callback_thread.joinable()) callback_thread.join();
+  printSensorInputTelemetry(true);
+  if (callback_failure) std::rethrow_exception(callback_failure);
+  if (estimator_failure) std::rethrow_exception(estimator_failure);
   printPublishRateSummary();
   savePCD();
 }
@@ -917,9 +1132,147 @@ void LIVMapper::RGBpointBodyLidarToIMU(PointType const *const pi, PointType *con
   po->normal_z = pi->normal_z;
 }
 
-void LIVMapper::standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg)
+void LIVMapper::standard_pcl_ingest_cbk(
+    const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg)
 {
   if (!beginInputCallback(lidar_en)) return;
+  ++lidar_callback_total;
+  const double source_time = stamp2Sec(msg->header.stamp);
+  const double receive_time = std::chrono::duration<double>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+  callback_receive_steady_time.store(receive_time, std::memory_order_relaxed);
+  if (!std::isfinite(source_time) ||
+      (last_lidar_callback_source_time >= 0.0 &&
+       source_time < last_lidar_callback_source_time))
+  {
+    ++lidar_drop_total;
+    endInputCallback();
+    return;
+  }
+  last_lidar_callback_source_time = source_time;
+  const bool overflow = lidar_input_queue.push(QueuedSensorInput{
+      source_time, receive_time, false,
+      [this, msg]() { standard_pcl_cbk(msg); }});
+  ++lidar_enqueued_total;
+  if (overflow) ++lidar_drop_total;
+  endInputCallback();
+}
+
+void LIVMapper::livox_pcl_ingest_cbk(
+    const livox_custom_msg::CustomMsg::ConstSharedPtr &msg)
+{
+  if (!beginInputCallback(lidar_en)) return;
+  ++lidar_callback_total;
+  const double source_time = stamp2Sec(msg->header.stamp);
+  const double receive_time = std::chrono::duration<double>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+  callback_receive_steady_time.store(receive_time, std::memory_order_relaxed);
+  if (!std::isfinite(source_time) ||
+      (last_lidar_callback_source_time >= 0.0 &&
+       source_time < last_lidar_callback_source_time))
+  {
+    ++lidar_drop_total;
+    endInputCallback();
+    return;
+  }
+  last_lidar_callback_source_time = source_time;
+  const bool overflow = lidar_input_queue.push(QueuedSensorInput{
+      source_time, receive_time, false,
+      [this, msg]() { livox_pcl_cbk(msg); }});
+  ++lidar_enqueued_total;
+  if (overflow) ++lidar_drop_total;
+  endInputCallback();
+}
+
+#if defined(USE_LIVOX_ROS_DRIVER2) && defined(USE_LIVOX_INTERFACES)
+void LIVMapper::livox_interfaces_pcl_ingest_cbk(
+    const livox_interfaces::msg::CustomMsg::ConstSharedPtr &msg)
+{
+  if (!beginInputCallback(lidar_en)) return;
+  ++lidar_callback_total;
+  const double source_time = stamp2Sec(msg->header.stamp);
+  const double receive_time = std::chrono::duration<double>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+  callback_receive_steady_time.store(receive_time, std::memory_order_relaxed);
+  if (!std::isfinite(source_time) ||
+      (last_lidar_callback_source_time >= 0.0 &&
+       source_time < last_lidar_callback_source_time))
+  {
+    ++lidar_drop_total;
+    endInputCallback();
+    return;
+  }
+  last_lidar_callback_source_time = source_time;
+  const bool overflow = lidar_input_queue.push(QueuedSensorInput{
+      source_time, receive_time, false,
+      [this, msg]() { livox_interfaces_pcl_cbk(msg); }});
+  ++lidar_enqueued_total;
+  if (overflow) ++lidar_drop_total;
+  endInputCallback();
+}
+#endif
+
+void LIVMapper::imu_ingest_cbk(
+    const sensor_msgs::msg::Imu::ConstSharedPtr &msg)
+{
+  if (!beginInputCallback(imu_en)) return;
+  ++imu_source_callback_total;
+  const double source_time = stamp2Sec(msg->header.stamp);
+  const double receive_time = std::chrono::duration<double>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+  callback_receive_steady_time.store(receive_time, std::memory_order_relaxed);
+  if (!std::isfinite(source_time) ||
+      (last_imu_callback_source_time >= 0.0 &&
+       source_time <= last_imu_callback_source_time))
+  {
+    ++imu_reader_drop_total;
+    endInputCallback();
+    return;
+  }
+  bool discontinuity = false;
+  if (last_imu_callback_source_time >= 0.0)
+  {
+    const double delta = source_time - last_imu_callback_source_time;
+    updateMaximum(imu_source_delta_max, delta);
+    discontinuity = delta > kImuGapThresholdSeconds;
+    if (discontinuity) ++imu_reader_drop_total;
+  }
+  last_imu_callback_source_time = source_time;
+  const bool overflow = imu_input_queue.push(QueuedSensorInput{
+      source_time, receive_time, discontinuity,
+      [this, msg]() { imu_cbk(msg); }});
+  ++imu_enqueued_total;
+  if (overflow) ++imu_queue_overflow_total;
+  endInputCallback();
+}
+
+void LIVMapper::img_ingest_cbk(
+    const sensor_msgs::msg::Image::ConstSharedPtr &msg)
+{
+  if (!beginInputCallback(img_en)) return;
+  const double source_time = stamp2Sec(msg->header.stamp);
+  const double receive_time = std::chrono::duration<double>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+  callback_receive_steady_time.store(receive_time, std::memory_order_relaxed);
+  if (!std::isfinite(source_time) ||
+      (last_image_callback_source_time >= 0.0 &&
+       source_time <= last_image_callback_source_time))
+  {
+    endInputCallback();
+    return;
+  }
+  last_image_callback_source_time = source_time;
+  if (image_input_queue.push(QueuedSensorInput{
+          source_time, receive_time, false,
+          [this, msg]() { img_cbk(msg); }}))
+  {
+    ++image_queue_overflow_total;
+  }
+  endInputCallback();
+}
+
+void LIVMapper::standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg)
+{
   mtx_buffer.lock();
 
   double cur_head_time = stamp2Sec(msg->header.stamp) + lidar_time_offset;
@@ -931,18 +1284,28 @@ void LIVMapper::standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::ConstShare
   }
   PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
   p_pre->process(msg, ptr);
+  if (lid_raw_data_buffer.size() == LIDAR_QUEUE_CAPACITY)
+  {
+    if (lidar_pushed)
+    {
+      ++lidar_drop_total;
+      mtx_buffer.unlock();
+      return;
+    }
+    lid_raw_data_buffer.pop_front();
+    lid_header_time_buffer.pop_front();
+    ++lidar_drop_total;
+  }
   lid_raw_data_buffer.push_back(ptr);
   lid_header_time_buffer.push_back(cur_head_time);
   last_timestamp_lidar = cur_head_time;
 
   mtx_buffer.unlock();
   sig_buffer.notify_all();
-  endInputCallback();
 }
 
 void LIVMapper::livox_pcl_cbk(const livox_custom_msg::CustomMsg::ConstSharedPtr &msg_in)
 {
-  if (!beginInputCallback(lidar_en)) return;
   mtx_buffer.lock();
   livox_custom_msg::CustomMsg::SharedPtr msg(new livox_custom_msg::CustomMsg(*msg_in));
   // if ((abs(stamp2Sec(msg->header.stamp) - last_timestamp_lidar) > 0.2 && last_timestamp_lidar > 0) || sync_jump_flag)
@@ -963,29 +1326,32 @@ void LIVMapper::livox_pcl_cbk(const livox_custom_msg::CustomMsg::ConstSharedPtr 
   if (!ptr || ptr->empty()) {
     RCLCPP_ERROR(this->node->get_logger(), "Received an empty point cloud");
     mtx_buffer.unlock();
-    endInputCallback();
     return;
   }
 
+  if (lid_raw_data_buffer.size() == LIDAR_QUEUE_CAPACITY)
+  {
+    if (lidar_pushed)
+    {
+      ++lidar_drop_total;
+      mtx_buffer.unlock();
+      return;
+    }
+    lid_raw_data_buffer.pop_front();
+    lid_header_time_buffer.pop_front();
+    ++lidar_drop_total;
+  }
   lid_raw_data_buffer.push_back(ptr);
   lid_header_time_buffer.push_back(cur_head_time);
   last_timestamp_lidar = cur_head_time;
 
   mtx_buffer.unlock();
   sig_buffer.notify_all();
-  endInputCallback();
 }
 
 #if defined(USE_LIVOX_ROS_DRIVER2) && defined(USE_LIVOX_INTERFACES)
 void LIVMapper::livox_interfaces_pcl_cbk(const livox_interfaces::msg::CustomMsg::ConstSharedPtr &msg_in)
 {
-  if (!lidar_en) return;
-  if (!input_admission_open)
-  {
-    ++input_sequence;
-    ++rejected_input_after_quiesce_count;
-    return;
-  }
   // Convert livox_interfaces::msg::CustomMsg to livox_ros_driver2::msg::CustomMsg
   auto converted = std::make_shared<livox_custom_msg::CustomMsg>();
   converted->header = msg_in->header;
@@ -1009,11 +1375,8 @@ void LIVMapper::livox_interfaces_pcl_cbk(const livox_interfaces::msg::CustomMsg:
 
 void LIVMapper::imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in)
 {
-  if (!beginInputCallback(imu_en)) return;
-
   if (last_timestamp_lidar < 0.0)
   {
-    endInputCallback();
     return;
   }
   // 200 Hz callback 不能执行逐样本 I/O；异常仍由下方节流 WARN 保持可观测。
@@ -1040,29 +1403,38 @@ void LIVMapper::imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in)
     mtx_buffer.unlock();
     sig_buffer.notify_all();
     RCLCPP_ERROR(this->node->get_logger(), "imu loop back, offset: %lf \n", last_timestamp_imu - timestamp);
-    endInputCallback();
     return;
   }
 
   if (last_timestamp_imu > 0.0 && timestamp > last_timestamp_imu + 0.2)
   {
-    RCLCPP_WARN(this->node->get_logger(), "imu time stamp Jumps %0.4lf seconds, resetting IMU timeline\n", timestamp - last_timestamp_imu);
-    imu_buffer.clear();
+    RCLCPP_WARN(this->node->get_logger(), "imu time stamp Jumps %0.4lf seconds, invalidating current scan coverage\n", timestamp - last_timestamp_imu);
+    imu_input_continuity_lost = true;
   }
 
   last_timestamp_imu = timestamp;
 
+  if (imu_buffer.size() == IMU_QUEUE_CAPACITY)
+  {
+    imu_buffer.pop_front();
+    ++imu_queue_overflow_total;
+    imu_input_continuity_lost = true;
+  }
   imu_buffer.push_back(msg);
   mtx_buffer.unlock();
   {
     mtx_buffer_imu_prop.lock();
-    if (imu_prop_enable && !p_imu->imu_need_init) { prop_imu_buffer.push_back(*msg); }
+    if (imu_prop_enable && !p_imu->imu_need_init)
+    {
+      if (prop_imu_buffer.size() == IMU_QUEUE_CAPACITY)
+        prop_imu_buffer.pop_front();
+      prop_imu_buffer.push_back(*msg);
+    }
     newest_imu = *msg;
     new_imu = true;
     mtx_buffer_imu_prop.unlock();
   }
   sig_buffer.notify_all();
-  endInputCallback();
 }
 
 cv::Mat LIVMapper::getImageFromMsg(const sensor_msgs::msg::Image::ConstSharedPtr &img_msg)
@@ -1075,7 +1447,6 @@ cv::Mat LIVMapper::getImageFromMsg(const sensor_msgs::msg::Image::ConstSharedPtr
 // static int i = 0;
 void LIVMapper::img_cbk(const sensor_msgs::msg::Image::ConstSharedPtr &msg_in)
 {
-  if (!beginInputCallback(img_en)) return;
   sensor_msgs::msg::Image::SharedPtr msg(new sensor_msgs::msg::Image(*msg_in));
   // if ((abs(stamp2Sec(msg->header.stamp) - last_timestamp_img) > 0.2 && last_timestamp_img > 0) || sync_jump_flag)
   // {
@@ -1090,7 +1461,6 @@ void LIVMapper::img_cbk(const sensor_msgs::msg::Image::ConstSharedPtr &msg_in)
     static int frame_counter = 0;
     if (++frame_counter % 4 != 0)
     {
-      endInputCallback();
       return;
     }
   }
@@ -1098,20 +1468,17 @@ void LIVMapper::img_cbk(const sensor_msgs::msg::Image::ConstSharedPtr &msg_in)
   double msg_header_time = stamp2Sec(msg->header.stamp) + img_time_offset;
   if (abs(msg_header_time - last_timestamp_img) < 0.001)
   {
-    endInputCallback();
     return;
   }
   RCLCPP_INFO(this->node->get_logger(), "Get image, its header time: %.6f", msg_header_time);
   if (last_timestamp_lidar < 0)
   {
-    endInputCallback();
     return;
   }
 
   if (msg_header_time < last_timestamp_img)
   {
     RCLCPP_ERROR(this->node->get_logger(), "image loop back. \n");
-    endInputCallback();
     return;
   }
 
@@ -1124,11 +1491,16 @@ void LIVMapper::img_cbk(const sensor_msgs::msg::Image::ConstSharedPtr &msg_in)
     RCLCPP_WARN(this->node->get_logger(), "Image need Jumps: %.6f", img_time_correct);
     mtx_buffer.unlock();
     sig_buffer.notify_all();
-    endInputCallback();
     return;
   }
 
   cv::Mat img_cur = getImageFromMsg(msg);
+  if (img_buffer.size() == IMAGE_QUEUE_CAPACITY)
+  {
+    img_buffer.pop_front();
+    img_time_buffer.pop_front();
+    ++image_queue_overflow_total;
+  }
   img_buffer.push_back(img_cur);
   img_time_buffer.push_back(img_time_correct);
 
@@ -1140,7 +1512,6 @@ void LIVMapper::img_cbk(const sensor_msgs::msg::Image::ConstSharedPtr &msg_in)
   // cout<<"last_timestamp_img:::"<<last_timestamp_img<<endl;
   mtx_buffer.unlock();
   sig_buffer.notify_all();
-  endInputCallback();
 }
 
 bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
@@ -1661,7 +2032,8 @@ std::size_t LIVMapper::pendingLidarFrameCount() const
 {
   const bool pending_livo_vio =
       slam_mode_ == LIVO && LidarMeasures.lio_vio_flg == LIO;
-  return lid_raw_data_buffer.size() + (pending_livo_vio ? 1U : 0U);
+  return lidar_input_queue.size() + lid_raw_data_buffer.size() +
+         (pending_livo_vio ? 1U : 0U);
 }
 
 bool LIVMapper::producerIdle() const

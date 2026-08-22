@@ -217,6 +217,24 @@ install(
 )
 
 if(BUILD_TESTING)
+  add_executable(bounded_sensor_queue_test test/bounded_sensor_queue_test.cpp)
+  target_include_directories(bounded_sensor_queue_test PRIVATE include)
+  target_compile_options(bounded_sensor_queue_test PRIVATE
+    -Wall -Wextra -Wpedantic
+  )
+  add_test(NAME bounded_sensor_queue COMMAND bounded_sensor_queue_test)
+  add_executable(imu_coverage_contract_test test/imu_coverage_contract_test.cpp)
+  target_include_directories(imu_coverage_contract_test PRIVATE include)
+  target_compile_options(imu_coverage_contract_test PRIVATE
+    -Wall -Wextra -Wpedantic
+  )
+  add_test(NAME imu_coverage_contract COMMAND imu_coverage_contract_test)
+  add_executable(voxel_grid_safety_test test/voxel_grid_safety_test.cpp)
+  target_include_directories(voxel_grid_safety_test PRIVATE include)
+  target_compile_options(voxel_grid_safety_test PRIVATE
+    -Wall -Wextra -Wpedantic
+  )
+  add_test(NAME voxel_grid_safety COMMAND voxel_grid_safety_test)
   add_test(
     NAME sophus_dependency_contract
     COMMAND ${CMAKE_COMMAND}

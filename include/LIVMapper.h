@@ -14,9 +14,15 @@ which is included as part of this source code package.
 #define LIV_MAPPER_H
 
 #include <chrono>
+#include <atomic>
 #include <cstdint>
+#include <functional>
+#include <string>
 
 #include "IMU_Processing.h"
+#include "bounded_sensor_queue.hpp"
+#include "imu_coverage_contract.hpp"
+#include "voxel_grid_safety.hpp"
 #include "vio.h"
 #include "preprocess.h"
 #if __has_include(<cv_bridge/cv_bridge.hpp>)
@@ -56,12 +62,22 @@ public:
   void RGBpointBodyLidarToIMU(PointType const *const pi, PointType *const po);
   void RGBpointBodyToWorld(PointType const *const pi, PointType *const po);
   void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg);
+  void standard_pcl_ingest_cbk(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg);
   void livox_pcl_cbk(const livox_custom_msg::CustomMsg::ConstSharedPtr &msg_in);
+  void livox_pcl_ingest_cbk(const livox_custom_msg::CustomMsg::ConstSharedPtr &msg_in);
 #if defined(USE_LIVOX_ROS_DRIVER2) && defined(USE_LIVOX_INTERFACES)
   void livox_interfaces_pcl_cbk(const livox_interfaces::msg::CustomMsg::ConstSharedPtr &msg_in);
+  void livox_interfaces_pcl_ingest_cbk(const livox_interfaces::msg::CustomMsg::ConstSharedPtr &msg_in);
 #endif
   void imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in);
+  void imu_ingest_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in);
   void img_cbk(const sensor_msgs::msg::Image::ConstSharedPtr &msg_in);
+  void img_ingest_cbk(const sensor_msgs::msg::Image::ConstSharedPtr &msg_in);
+  void drainSensorInputs();
+  void printSensorInputTelemetry(bool force);
+  bool validateCurrentImuCoverage();
+  bool validateCurrentVoxelGridInput();
+  void rejectCurrentMeasurement(const char *reason);
   void publish_img_rgb(const image_transport::Publisher &pubImage, VIOManagerPtr vio_manager);
   void publish_frame_world(const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pubLaserCloudFullRes, VIOManagerPtr vio_manager);
   void publish_visual_sub_map(const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &pubSubVisualMap);
@@ -87,6 +103,18 @@ public:
   template <typename T> void pointBodyToWorld(const Eigen::Matrix<T, 3, 1> &pi, Eigen::Matrix<T, 3, 1> &po);
   template <typename T> Eigen::Matrix<T, 3, 1> pointBodyToWorld(const Eigen::Matrix<T, 3, 1> &pi);
   cv::Mat getImageFromMsg(const sensor_msgs::msg::Image::ConstSharedPtr &img_msg);
+
+  static constexpr std::size_t IMU_QUEUE_CAPACITY = 200U;
+  static constexpr std::size_t LIDAR_QUEUE_CAPACITY = 10U;
+  static constexpr std::size_t IMAGE_QUEUE_CAPACITY = 8U;
+
+  struct QueuedSensorInput
+  {
+    double source_timestamp{0.0};
+    double receive_steady_time{0.0};
+    bool discontinuity_before{false};
+    std::function<void()> consume;
+  };
 
   std::mutex mtx_buffer, mtx_buffer_imu_prop;
   std::condition_variable sig_buffer;
@@ -212,6 +240,7 @@ public:
 #endif
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_img;
+  rclcpp::CallbackGroup::SharedPtr sensor_callback_group;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFullRes;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pubNormal;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubSubVisualMap;
@@ -225,7 +254,6 @@ public:
   image_transport::Publisher pubImage;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr mavros_pose_publisher;
   std::shared_ptr<tf2_ros::TransformBroadcaster> transform_broadcaster;
-  rclcpp::TimerBase::SharedPtr imu_prop_timer;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr shutdown_counter_service;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr producer_quiesce_service;
   rclcpp::Node::SharedPtr node;
@@ -237,12 +265,39 @@ public:
   bool colmap_output_en = false;
   std::uint64_t odometry_published_count = 0;
   std::uint64_t cloud_published_count = 0;
-  std::uint64_t input_sequence = 0;
-  std::uint64_t completed_frame_sequence = 0;
-  std::uint64_t rejected_input_after_quiesce_count = 0;
-  std::size_t input_callback_active_count = 0;
-  bool input_admission_open = true;
-  bool lio_frame_inflight = false;
+  std::atomic<std::uint64_t> input_sequence{0U};
+  std::atomic<std::uint64_t> completed_frame_sequence{0U};
+  std::atomic<std::uint64_t> rejected_input_after_quiesce_count{0U};
+  std::atomic<std::size_t> input_callback_active_count{0U};
+  std::atomic<bool> input_admission_open{true};
+  std::atomic<bool> lio_frame_inflight{false};
+  fast_livo::BoundedSensorQueue<QueuedSensorInput, IMU_QUEUE_CAPACITY>
+      imu_input_queue;
+  fast_livo::BoundedSensorQueue<QueuedSensorInput, LIDAR_QUEUE_CAPACITY>
+      lidar_input_queue;
+  fast_livo::BoundedSensorQueue<QueuedSensorInput, IMAGE_QUEUE_CAPACITY>
+      image_input_queue;
+  std::atomic<std::uint64_t> imu_source_callback_total{0U};
+  std::atomic<std::uint64_t> imu_enqueued_total{0U};
+  std::atomic<std::uint64_t> imu_reader_drop_total{0U};
+  std::atomic<std::uint64_t> imu_queue_overflow_total{0U};
+  std::atomic<std::uint64_t> lidar_callback_total{0U};
+  std::atomic<std::uint64_t> lidar_enqueued_total{0U};
+  std::atomic<std::uint64_t> lidar_drop_total{0U};
+  std::atomic<std::uint64_t> image_queue_overflow_total{0U};
+  std::atomic<double> imu_source_delta_max{0.0};
+  std::atomic<double> imu_consumer_delta_max{0.0};
+  std::atomic<double> callback_receive_steady_time{0.0};
+  double last_imu_callback_source_time{-1.0};
+  double last_lidar_callback_source_time{-1.0};
+  double last_image_callback_source_time{-1.0};
+  double last_imu_consumer_source_time{-1.0};
+  bool imu_input_continuity_lost{false};
+  bool imu_recovery_pending{false};
+  double last_valid_imu_timestamp{-1.0};
+  std::atomic<std::uint64_t> invalid_imu_coverage_total{0U};
+  std::atomic<std::uint64_t> voxel_grid_reject_total{0U};
+  std::chrono::steady_clock::time_point last_sensor_telemetry_time{};
   std::chrono::steady_clock::time_point rate_window_start;
   bool rate_window_started = false;
 };

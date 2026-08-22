@@ -49,6 +49,22 @@ void ImuProcess::Reset()
   cur_pcl_un_.reset(new PointCloudXYZI());
 }
 
+void ImuProcess::RebaseAfterGap(
+    const double propagation_start_timestamp,
+    const sensor_msgs::msg::Imu::ConstSharedPtr &first_continuous_imu)
+{
+  // 只丢弃跨 gap 的时间积分历史；gravity/bias/covariance 与外层 estimator state
+  // 保持不变。下一帧从已证明连续的 scan 起点重新积分，禁止把旧 last_imu
+  // 与 gap 后样本拼接成一个虚假的大 dt。
+  last_imu = first_continuous_imu;
+  last_prop_end_time = propagation_start_timestamp;
+  time_last_scan = propagation_start_timestamp;
+  IMUpose.clear();
+  pcl_wait_proc.clear();
+  angvel_last = Zero3d;
+  acc_s_last = Zero3d;
+}
+
 void ImuProcess::disable_imu()
 {
   cout << "IMU Disabled !!!!!" << endl;
